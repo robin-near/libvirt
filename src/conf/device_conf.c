@@ -68,6 +68,7 @@ virDeviceHostdevPCIDriverInfoParseXML(xmlNodePtr node,
     }
 
     driver->model = virXMLPropString(node, "model");
+    driver->iommufd = virXMLPropString(node, "iommufd");
     return 0;
 }
 
@@ -92,6 +93,7 @@ virDeviceHostdevPCIDriverInfoFormat(virBuffer *buf,
     }
 
     virBufferEscapeString(&driverAttrBuf, " model='%s'", driver->model);
+    virBufferEscapeString(&driverAttrBuf, " iommufd='%s'", driver->iommufd);
 
     virXMLFormatElement(buf, "driver", &driverAttrBuf, NULL);
     return 0;
@@ -102,6 +104,7 @@ void
 virDeviceHostdevPCIDriverInfoClear(virDeviceHostdevPCIDriverInfo *driver)
 {
     VIR_FREE(driver->model);
+    VIR_FREE(driver->iommufd);
 }
 
 

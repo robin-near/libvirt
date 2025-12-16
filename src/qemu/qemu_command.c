@@ -4779,6 +4779,7 @@ qemuBuildPCIHostdevDevProps(const virDomainDef *def,
                               "S:failover_pair_id", failover_pair_id,
                               "S:display", qemuOnOffAuto(pcisrc->display),
                               "B:ramfb", ramfb,
+                              "S:iommufd", pcisrc->driver.iommufd,
                               NULL) < 0)
         return NULL;
 
