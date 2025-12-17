@@ -260,6 +260,7 @@ struct _qemuDomainObjPrivate {
     pid_t schedCoreChildFD;
 
     GSList *threadContextAliases; /* List of IDs of thread-context objects */
+    GHashTable *iommufdObjects; /* Hash table of iommufd object IDs (key=id, value=boolean) */
 
     /* named file descriptor groups associated with the VM */
     GHashTable *fds;

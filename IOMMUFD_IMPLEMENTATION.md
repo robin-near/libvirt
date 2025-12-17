@@ -22,8 +22,11 @@ This implementation allows users to specify an `iommufd` parameter in the hostde
 The above XML will generate a QEMU command line similar to:
 
 ```
+-object iommufd,id=iommufd0
 -device vfio-pci,host=9a:00.0,bus=pci.5,iommufd=iommufd0
 ```
+
+**Important:** The `-object iommufd,id=iommufd0` is automatically generated before the device that uses it. If multiple devices reference the same iommufd object, the object is only created once.
 
 ## Files Modified
 
@@ -134,8 +137,38 @@ virDeviceHostdevPCIDriverInfoClear(virDeviceHostdevPCIDriverInfo *driver)
 }
 ```
 
-### 4. src/qemu/qemu_command.c (lines 4774-4784)
-**Purpose:** Added `iommufd` property to QEMU device command line generation
+### 4. src/qemu/qemu_domain.h (line 263)
+**Purpose:** Added hash table to track iommufd objects and prevent duplicates
+
+```c
+GSList *threadContextAliases; /* List of IDs of thread-context objects */
+GHashTable *iommufdObjects; /* Hash table of iommufd object IDs (key=id, value=boolean) */  // NEW LINE
+```
+
+### 5. src/qemu/qemu_domain.c
+
+**a) Initialization (line 2005):**
+Initialize the iommufd hash table when creating domain private data:
+
+```c
+priv->blockjobs = virHashNew(virObjectUnref);
+priv->fds = virHashNew(g_object_unref);
+priv->iommufdObjects = virHashNew(NULL);  // NEW LINE
+```
+
+**b) Cleanup (line 1977):**
+Free the iommufd hash table when destroying domain private data:
+
+```c
+g_clear_pointer(&priv->blockjobs, g_hash_table_unref);
+g_clear_pointer(&priv->fds, g_hash_table_unref);
+g_clear_pointer(&priv->iommufdObjects, g_hash_table_unref);  // NEW LINE
+```
+
+### 6. src/qemu/qemu_command.c
+
+**a) Device Property Addition (lines 4774-4784):**
+Added `iommufd` property to QEMU device command line generation:
 
 ```c
 if (virJSONValueObjectAdd(&props,
@@ -151,6 +184,71 @@ if (virJSONValueObjectAdd(&props,
     return NULL;
 ```
 
+**b) IOMMUFD Object Generation (lines 5193-5237):**
+New function to generate `-object iommufd` command line arguments:
+
+```c
+static int
+qemuBuildIOMMUFDCommandLine(virCommand *cmd,
+                            const virDomainDef *def,
+                            virDomainObj *vm)
+{
+    qemuDomainObjPrivate *priv = QEMU_DOMAIN_PRIVATE(vm);
+    size_t i;
+
+    for (i = 0; i < def->nhostdevs; i++) {
+        virDomainHostdevDef *hostdev = def->hostdevs[i];
+        virDomainHostdevSubsys *subsys = &hostdev->source.subsys;
+        const char *iommufd = NULL;
+        g_autoptr(virJSONValue) props = NULL;
+
+        if (hostdev->mode != VIR_DOMAIN_HOSTDEV_MODE_SUBSYS)
+            continue;
+
+        if (subsys->type != VIR_DOMAIN_HOSTDEV_SUBSYS_TYPE_PCI)
+            continue;
+
+        iommufd = subsys->u.pci.driver.iommufd;
+        if (!iommufd)
+            continue;
+
+        /* Check if this iommufd object was already added */
+        if (virHashHasEntry(priv->iommufdObjects, iommufd))
+            continue;
+
+        /* Create the iommufd object */
+        if (virJSONValueObjectAdd(&props,
+                                  "s:qom-type", "iommufd",
+                                  "s:id", iommufd,
+                                  NULL) < 0)
+            return -1;
+
+        if (qemuBuildObjectCommandlineFromJSON(cmd, props) < 0)
+            return -1;
+
+        /* Mark this iommufd as added */
+        if (virHashAddEntry(priv->iommufdObjects, iommufd, (void *)0x1) < 0)
+            return -1;
+    }
+
+    return 0;
+}
+```
+
+**c) Function Call (line 10925):**
+Call the iommufd object builder before building hostdev devices:
+
+```c
+if (qemuBuildRedirdevCommandLine(cmd, def, qemuCaps) < 0)
+    return NULL;
+
+if (qemuBuildIOMMUFDCommandLine(cmd, def, vm) < 0)  // NEW LINE
+    return NULL;
+
+if (qemuBuildHostdevCommandLine(cmd, def, qemuCaps) < 0)
+    return NULL;
+```
+
 ## Implementation Details
 
 ### Data Flow
@@ -159,12 +257,18 @@ if (virJSONValueObjectAdd(&props,
    - XML attribute `iommufd="iommufd0"` is parsed by `virDeviceHostdevPCIDriverInfoParseXML()`
    - Value is stored in `virDeviceHostdevPCIDriverInfo.iommufd` field
 
-2. **Structure → QEMU:**
-   - During QEMU command line generation, `qemuBuildPCIHostdevDevProps()` accesses the iommufd value
-   - Value is added to JSON properties with key "iommufd"
-   - JSON is converted to QEMU device command line argument
+2. **Structure → QEMU Objects:**
+   - During QEMU command line generation, `qemuBuildIOMMUFDCommandLine()` is called
+   - Function iterates through all hostdevs looking for PCI devices with iommufd specified
+   - For each unique iommufd ID, creates a `-object iommufd,id=<id>` argument
+   - Uses hash table to track which iommufd objects have been created to avoid duplicates
 
-3. **Structure → XML:**
+3. **Structure → QEMU Device:**
+   - After objects are created, `qemuBuildPCIHostdevDevProps()` accesses the iommufd value
+   - Value is added to device JSON properties with key "iommufd"
+   - JSON is converted to QEMU device command line argument: `-device vfio-pci,...,iommufd=<id>`
+
+4. **Structure → XML:**
    - When dumping domain XML, `virDeviceHostdevPCIDriverInfoFormat()` writes the iommufd attribute back
 
 ### Memory Management
@@ -179,6 +283,41 @@ if (virJSONValueObjectAdd(&props,
 The `iommufd` property uses the `"S:"` prefix in `virJSONValueObjectAdd()`, which means:
 - **S** = String (optional) - the property will only be added to JSON if the string is non-NULL
 - This prevents adding `"iommufd":null` to the QEMU command line when the attribute is not specified
+
+### Deduplication Mechanism
+
+To prevent multiple `-object iommufd` declarations for the same ID:
+
+1. **Hash Table Tracking:**
+   - A hash table `priv->iommufdObjects` is maintained in the domain private data
+   - Key: iommufd ID string (e.g., "iommufd0")
+   - Value: A dummy pointer (0x1) indicating the object was created
+
+2. **Deduplication Process:**
+   - When building the command line, `qemuBuildIOMMUFDCommandLine()` iterates through all hostdevs
+   - For each hostdev with an iommufd attribute:
+     - Check if the ID already exists in the hash table using `virHashHasEntry()`
+     - If not found, create the `-object iommufd,id=<id>` argument and add the ID to the hash table
+     - If found, skip object creation (it was already added by a previous hostdev)
+
+3. **Example with Multiple Devices:**
+   ```xml
+   <hostdev mode='subsystem' type='pci'>
+     <driver name='vfio' iommufd='iommufd0'/>
+     <source><address domain='0x0000' bus='0x9a' slot='0x00' function='0x0'/></source>
+   </hostdev>
+   <hostdev mode='subsystem' type='pci'>
+     <driver name='vfio' iommufd='iommufd0'/>
+     <source><address domain='0x0000' bus='0x9a' slot='0x00' function='0x1'/></source>
+   </hostdev>
+   ```
+
+   Results in:
+   ```
+   -object iommufd,id=iommufd0          (created once)
+   -device vfio-pci,host=9a:00.0,iommufd=iommufd0
+   -device vfio-pci,host=9a:00.1,iommufd=iommufd0
+   ```
 
 ## Usage Example
 
@@ -209,8 +348,11 @@ See [example_iommufd_hostdev.xml](example_iommufd_hostdev.xml) for a complete wo
 ### Expected QEMU Command Line Fragment
 
 ```
+-object iommufd,id=iommufd0
 -device vfio-pci,host=0000:9a:00.0,id=hostdev0,bus=pci.0,addr=0x5,iommufd=iommufd0
 ```
+
+Note: The `-object` line is automatically generated before the device.
 
 ## Testing
 

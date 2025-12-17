@@ -2346,6 +2346,8 @@ mymain(void)
     DO_TEST_CAPS_LATEST("hostdev-pci-address-device");
     DO_TEST_CAPS_LATEST_PARSE_ERROR("hostdev-pci-duplicate");
     DO_TEST_CAPS_LATEST("hostdev-pci-display-ramfb");
+    DO_TEST_CAPS_LATEST("hostdev-pci-iommufd");
+    DO_TEST_CAPS_LATEST("hostdev-pci-iommufd-multiple");
     DO_TEST_CAPS_LATEST("hostdev-vfio");
     DO_TEST_CAPS_LATEST("hostdev-vfio-multidomain");
     DO_TEST_CAPS_LATEST("hostdev-mdev-precreated");

@@ -5191,6 +5191,53 @@ qemuBuildAcpiNodesetProps(virCommand *cmd,
 
 
 static int
+qemuBuildIOMMUFDCommandLine(virCommand *cmd,
+                            const virDomainDef *def,
+                            virDomainObj *vm)
+{
+    qemuDomainObjPrivate *priv = QEMU_DOMAIN_PRIVATE(vm);
+    size_t i;
+
+    for (i = 0; i < def->nhostdevs; i++) {
+        virDomainHostdevDef *hostdev = def->hostdevs[i];
+        virDomainHostdevSubsys *subsys = &hostdev->source.subsys;
+        const char *iommufd = NULL;
+        g_autoptr(virJSONValue) props = NULL;
+
+        if (hostdev->mode != VIR_DOMAIN_HOSTDEV_MODE_SUBSYS)
+            continue;
+
+        if (subsys->type != VIR_DOMAIN_HOSTDEV_SUBSYS_TYPE_PCI)
+            continue;
+
+        iommufd = subsys->u.pci.driver.iommufd;
+        if (!iommufd)
+            continue;
+
+        /* Check if this iommufd object was already added */
+        if (virHashHasEntry(priv->iommufdObjects, iommufd))
+            continue;
+
+        /* Create the iommufd object */
+        if (virJSONValueObjectAdd(&props,
+                                  "s:qom-type", "iommufd",
+                                  "s:id", iommufd,
+                                  NULL) < 0)
+            return -1;
+
+        if (qemuBuildObjectCommandlineFromJSON(cmd, props) < 0)
+            return -1;
+
+        /* Mark this iommufd as added */
+        if (virHashAddEntry(priv->iommufdObjects, iommufd, (void *)0x1) < 0)
+            return -1;
+    }
+
+    return 0;
+}
+
+
+static int
 qemuBuildHostdevCommandLine(virCommand *cmd,
                             const virDomainDef *def,
                             virQEMUCaps *qemuCaps)
@@ -10873,6 +10920,9 @@ qemuBuildCommandLine(virDomainObj *vm,
         return NULL;
 
     if (qemuBuildRedirdevCommandLine(cmd, def, qemuCaps) < 0)
+        return NULL;
+
+    if (qemuBuildIOMMUFDCommandLine(cmd, def, vm) < 0)
         return NULL;
 
     if (qemuBuildHostdevCommandLine(cmd, def, qemuCaps) < 0)
